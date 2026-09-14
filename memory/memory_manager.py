@@ -425,7 +425,11 @@ forget_memory = forget
 
 # ── Session memory ─────────────────────────────────────────────────────────────
 
-_SESSION_MAX = 3   # safety cap — in practice 0-1 entries after pop
+# Session summaries used to be capped at 3 and *deleted* on read, so the
+# assistant's own history of talking to you survived exactly one morning. The
+# cap is now a real archive: enough to answer "what were we working on last
+# week" without the file needing paging.
+_SESSION_MAX = 300
 
 
 def save_session_summary(summary: str, language: str = "") -> None:
@@ -455,9 +459,13 @@ def save_session_summary(summary: str, language: str = "") -> None:
 
 
 def pop_last_session() -> dict | None:
-    """
-    Return AND remove the most recent session entry.
-    Calling this consumes the entry so it is never repeated in future briefings.
+    """Return the most recent session summary not yet mentioned, and mark it.
+
+    This used to delete the entry. That stopped the morning briefing repeating
+    itself, but it also threw away the assistant's own history of every
+    conversation it had ever had — the one thing that would let it say "last
+    week you were stuck on this same file". Marking prevents the repeat;
+    deleting was discarding the archive in order to solve it.
     """
     with _lock:
         if not MEMORY_PATH.exists():
@@ -467,8 +475,11 @@ def pop_last_session() -> dict | None:
             sessions = memory.get("sessions", [])
             if not isinstance(sessions, list) or not sessions:
                 return None
-            entry = sessions.pop()          # remove the last entry
-            memory["sessions"] = sessions
+            entry = next((c for c in reversed(sessions)
+                          if not c.get("mentioned")), None)
+            if entry is None:
+                return None
+            entry["mentioned"] = True
             MEMORY_PATH.write_text(
                 json.dumps(memory, indent=2, ensure_ascii=False),
                 encoding="utf-8",

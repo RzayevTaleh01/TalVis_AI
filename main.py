@@ -49,6 +49,7 @@ import numpy as np
 from google import genai
 from google.genai import types
 from ui import TalVisUI
+from memory import journal, understanding
 from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt,
     save_session_summary, pop_last_session,
@@ -716,8 +717,32 @@ class TalVisLive:
         )
 
         parts = [time_ctx, identity_ctx]
+
+        # The picture of what the user is working towards comes before the
+        # facts, because it is what tells the assistant how to read them: the
+        # same stored detail matters differently depending on where they are
+        # heading.
+        try:
+            picture_str = understanding.format_for_prompt()
+        except Exception:
+            picture_str = ""
+        if picture_str:
+            parts.append(picture_str)
+
         if mem_str:
             parts.append(mem_str)
+
+        # What has been delegated to an agent, and how it went. Carried into
+        # every session so a task that died on a usage limit is something the
+        # assistant already knows about, rather than something the user has to
+        # explain again from scratch.
+        try:
+            work_str = journal.format_for_prompt()
+        except Exception:
+            work_str = ""
+        if work_str:
+            parts.append(work_str)
+
         parts.append(sys_prompt)
 
         cfg = dict(
@@ -789,7 +814,18 @@ class TalVisLive:
                 # the executor deliberately — it is a dictionary scan over a few
                 # hundred short strings, and a thread hop would cost more than
                 # the work itself.
-                result = search_memory(args.get("query", ""), limit=8)
+                _q = args.get("query", "")
+                result = search_memory(_q, limit=8)
+                # Facts and attempts are both "what do you remember" to a
+                # person asking, so one tool answers from both stores.
+                try:
+                    _work = journal.format_for_recall(_q)
+                except Exception:
+                    _work = ""
+                _empty = ("Nothing has been delegated" in _work
+                          or _work.startswith("No delegated task"))
+                if _work and not _empty:
+                    result = f"{result}\n\nDelegated work:\n{_work}"
 
             elif name == "undo":
                 if str(args.get("action", "")).lower().strip() == "list":
@@ -1351,11 +1387,21 @@ class TalVisLive:
         lang = lang or "English"
 
         convo = "\n".join(log[-40:])   # cap at last 40 turns to stay within token budget
-        prompt = (
-            f"Summarize this conversation in 1-2 sentences in {lang}. "
-            "Focus on what the user accomplished or discussed. "
-            "Output ONLY the summary text, nothing else:\n\n" + convo
-        )
+
+        # One call, two products. Summarising the conversation and updating the
+        # picture of what the user is working towards need the same transcript,
+        # so asking for both together costs nothing extra — and it means the
+        # understanding refreshes on every reconnect, not only on a clean exit.
+        try:
+            recent_work = journal.format_for_recall("")
+        except Exception:
+            recent_work = ""
+        prompt = understanding.reflection_prompt(
+            previous=understanding.load(),
+            conversation=convo,
+            recent_work=recent_work,
+        ) + f"\n\nWrite 'summary' in {lang}."
+
         try:
             from google import genai as _genai
             client = _genai.Client(api_key=_get_api_key())
@@ -1364,11 +1410,13 @@ class TalVisLive:
                 model="gemini-flash-latest",
                 contents=prompt,
             )
-            summary = (resp.text or "").strip()
+            summary, picture = understanding.parse_reflection(resp.text or "")
             if summary:
                 save_session_summary(summary, lang)
+            if picture:
+                await asyncio.to_thread(understanding.save, picture)
         except Exception as e:
-            print(f"[Memory] ⚠️ Session summary failed: {e}")
+            print(f"[Memory] ⚠️ Session reflection failed: {e}")
 
     # ── System monitor ──────────────────────────────────────────────────────────
 

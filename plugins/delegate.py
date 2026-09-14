@@ -1,5 +1,5 @@
 """
-plugins/claude_code.py — hand real development work to Claude Code.
+plugins/delegate.py — hand a whole task to a capable AI agent.
 
 WHY THIS EXISTS
     Gemini Live is a single-turn audio model. It answers, and it can call a
@@ -55,6 +55,8 @@ import threading
 import time
 from pathlib import Path
 
+from memory import journal
+
 # Spoken mode -> (permission mode, tools denied). bypassPermissions is absent
 # on purpose: there is no phrasing a user can say that reaches it.
 #
@@ -81,23 +83,74 @@ _last_session_id: str | None = None
 _lock = threading.Lock()
 
 
+# ── The agents ───────────────────────────────────────────────────────────────
+#
+# One entry per agent that can be handed a whole task. Claude Code is the only
+# one installed today, but the shape is what matters: an agent is a command to
+# build and a way to read what came back. Adding a second one — another CLI
+# agent, a local model with a runner — is a new entry here and nothing else,
+# because the job runner, the journal, the modes and the voice surface are all
+# agent-agnostic already.
+#
+# `speaks_json` marks an agent whose output is parsed as Claude Code's result
+# envelope; an agent that just prints text sets it False and the raw output is
+# used instead.
+_AGENTS: dict[str, dict] = {
+    "claude": {
+        "label": "Claude",
+        "exe": "claude",
+        "models": ("sonnet", "opus"),
+        "default_model": "sonnet",
+        "speaks_json": True,
+    },
+}
+_DEFAULT_AGENT = "claude"
+# What a person might call each agent out loud.
+_AGENT_ALIASES = {
+    "claude code": "claude", "claude-code": "claude", "anthropic": "claude",
+    "code agent": "claude", "coder": "claude",
+}
+
+
+def _resolve_agent(name: str) -> tuple[dict | None, str, str]:
+    """(spec, key, error). Falls back to the default when nothing is named."""
+    key = re.sub(r"\s+", " ", (name or "").strip().lower())
+    if not key:
+        key = _DEFAULT_AGENT
+    key = _AGENT_ALIASES.get(key, key)
+    spec = _AGENTS.get(key)
+    if spec is None:
+        return None, key, (
+            f"There is no agent called '{name}'. Available: "
+            f"{', '.join(sorted(_AGENTS))}. Ask the user which one they meant."
+        )
+    if not shutil.which(spec["exe"]):
+        return None, key, (
+            f"{spec['label']} is not installed on this computer, so it cannot "
+            f"be given the task."
+        )
+    return spec, key, ""
+
+
 PLUGIN = {
-    "name": "code_agent",
+    "name": "delegate",
     "description": (
-        "Hands a real development task to Claude Code — an agent that reads a "
-        "repository, edits files, runs commands and fixes its own errors. "
-        "Use it for multi-step technical work: adding a feature or plugin, "
-        "fixing a bug, refactoring, explaining why something crashes, or "
-        "reviewing a project. "
+        "Hands a whole task to an AI agent that works on this computer — it "
+        "reads files, edits them, runs commands, checks its own work and "
+        "fixes what it broke. Use it for anything that needs several steps "
+        "in a folder: building or changing a feature, fixing a bug, "
+        "refactoring, investigating why something crashes, reviewing or "
+        "summarising a project, reorganising files, running and repairing "
+        "tests. "
         "Each run works in one folder: whatever the user names in `project` "
         "(any folder on the computer, by name or full path), or the default "
         "workspace. If they do not say where, ask before guessing. "
         "Do NOT use it to open apps, change computer settings, search the web, "
         "or answer questions you can already answer yourself — it takes minutes "
-        "and spends the user's Claude plan allowance. "
+        "and spends the user's AI plan allowance. "
         "It returns IMMEDIATELY and keeps working in the background — say "
         "one short sentence and move on; the result is delivered to you "
-        "later as a [CODE_AGENT] message. Never call it twice for the same "
+        "later as a [AGENT] message. Never call it twice for the same "
         "request. Use action='status' if the user asks whether it is done, "
         "and action='cancel' to stop it."
     ),
@@ -134,6 +187,13 @@ PLUGIN = {
                 "type": "STRING",
                 "description": "sonnet (default, fast) or opus (slower, stronger).",
             },
+            "agent": {
+                "type": "STRING",
+                "description": (
+                    "Which agent to hand it to, when the user names one "
+                    "('ask Claude to…'). Omit for the default."
+                ),
+            },
             "action": {
                 "type": "STRING",
                 "description": (
@@ -145,7 +205,7 @@ PLUGIN = {
             "continue_previous": {
                 "type": "BOOLEAN",
                 "description": (
-                    "true to carry on the previous code_agent session instead "
+                    "true to carry on the previous delegated session instead "
                     "of starting fresh — use when the user says 'keep going', "
                     "'now also…', or refers back to what it just did."
                 ),
@@ -156,8 +216,8 @@ PLUGIN = {
 }
 
 PLUGIN_SETTINGS = {
-    "namespace": "claude_code",
-    "title": "Claude Code",
+    "namespace": "delegate",
+    "title": "Delegate (AI agents)",
     "fields": [
         {
             "key": "workspace",
@@ -207,7 +267,7 @@ PLUGIN_SETTINGS = {
 def _setting(key: str, fallback):
     try:
         from memory.config_manager import get_plugin_setting
-        value = get_plugin_setting("claude_code", key)
+        value = get_plugin_setting("delegate", key)
         if value not in (None, ""):
             return value
     except Exception:
@@ -331,7 +391,7 @@ def _resolve_project(name: str) -> tuple[Path | None, str]:
     if not root.is_dir():
         return None, (
             f"No projects folder is configured (looked in {root}). "
-            f"Tell the user to set it in Settings → Claude Code."
+            f"Tell the user to set it in Settings → Delegate."
         )
 
     # An absolute path means the user pointed somewhere explicitly — honour it
@@ -395,10 +455,10 @@ def _name_score(wanted: str, folder: str) -> int:
 
 
 def _log(player, message: str) -> None:
-    print(f"[code_agent] {message}")
+    print(f"[delegate] {message}")
     if player is not None:
         try:
-            player.write_log(f"[code_agent] {message}")
+            player.write_log(f"[delegate] {message}")
         except Exception:
             pass
 
@@ -439,13 +499,12 @@ def _subprocess_env() -> dict:
 
 # ── Running Claude Code ──────────────────────────────────────────────────────
 
-def _build_command(task: str, mode: str, model: str, workspace: Path,
-                   resume: str | None) -> list[str]:
-    exe = shutil.which("claude")
+def _build_command(spec: dict, task: str, mode: str, model: str,
+                   workspace: Path, resume: str | None) -> list[str]:
+    exe = shutil.which(spec["exe"])
     if not exe:
         raise FileNotFoundError(
-            "Claude Code is not installed, or not on PATH. Install it from "
-            "https://claude.com/claude-code"
+            f"{spec['label']} is not installed, or not on PATH."
         )
 
     permission, denied = _MODES[mode]
@@ -522,7 +581,7 @@ def _kill_tree(proc) -> None:
 def _announce(player, instruction: str) -> None:
     """Hand the finished work back to the live session.
 
-    [CODE_AGENT] is the same shape as the [SYSTEM_ALERT] and [PROACTIVE_CHECK]
+    [AGENT] is the same shape as the [SYSTEM_ALERT] and [PROACTIVE_CHECK]
     tags prompt.txt already defines, so the model speaks the substance in the
     user's own language instead of reading the tag out.
     """
@@ -539,7 +598,7 @@ def _clear_job() -> bool:
 
 
 def _worker(cmd: list[str], workspace: Path, mode: str, task: str,
-            timeout_s: int, player) -> None:
+            timeout_s: int, player, agent_key: str, agent_label: str) -> None:
     global _last_session_id
     started = time.monotonic()
     stdout = stderr = ""
@@ -558,9 +617,11 @@ def _worker(cmd: list[str], workspace: Path, mode: str, task: str,
         )
     except Exception as e:
         _log(player, f"could not start: {e}")
+        journal.record(task, "failed", agent=agent_key, detail=str(e)[:200],
+                       workspace=workspace.name, mode=mode)
         _clear_job()
         _announce(player, (
-            f"[CODE_AGENT] The coding agent could not start: {e}. "
+            f"[AGENT] The agent could not start: {e}. "
             f"Tell the user briefly, in their language."
         ))
         return
@@ -586,12 +647,18 @@ def _worker(cmd: list[str], workspace: Path, mode: str, task: str,
 
     if cancelled:
         _log(player, f"cancelled after {elapsed:.0f}s")
+        journal.record(task, "cancelled", agent=agent_key,
+                       detail="stopped by the user", workspace=workspace.name,
+                       mode=mode, duration_s=elapsed)
         return
 
     if timed_out:
         _log(player, f"timed out after {elapsed:.0f}s")
+        journal.record(task, "timeout", agent=agent_key,
+                       detail=f"hit the {timeout_s // 60}-minute limit",
+                       workspace=workspace.name, mode=mode, duration_s=elapsed)
         _announce(player, (
-            f"[CODE_AGENT] The coding agent hit its {timeout_s // 60}-minute "
+            f"[AGENT] The agent hit its {timeout_s // 60}-minute "
             f"limit and was stopped. Some of the work may already be saved. "
             f"Tell the user, in their language, in one short sentence."
         ))
@@ -606,8 +673,10 @@ def _worker(cmd: list[str], workspace: Path, mode: str, task: str,
     if payload is None:
         tail = (stderr or stdout or "").strip().splitlines()[-1:] or ["no output"]
         _log(player, f"failed after {elapsed:.0f}s: {tail[0][:120]}")
+        journal.record(task, "failed", agent=agent_key, detail=tail[0][:200],
+                       workspace=workspace.name, mode=mode, duration_s=elapsed)
         _announce(player, (
-            f"[CODE_AGENT] The coding agent failed: {tail[0][:200]}. "
+            f"[AGENT] The agent failed: {tail[0][:200]}. "
             f"Tell the user briefly, in their language."
         ))
         return
@@ -624,9 +693,16 @@ def _worker(cmd: list[str], workspace: Path, mode: str, task: str,
 
     if player is not None and result:
         try:
-            player.show_content(f"CODE AGENT — {mode.upper()}", result)
+            player.show_content(f"{agent_label} — {mode.upper()}", result)
         except Exception:
             pass
+
+    status = "failed" if payload.get("is_error") else "done"
+    journal.record(task, status, agent=agent_key,
+                   detail=_summarise(result, 160) if status == "failed" else "",
+                   workspace=workspace.name, mode=mode, duration_s=elapsed)
+    if status == "done":
+        journal.resolve_matching(task)
 
     extra = ""
     denials = payload.get("permission_denials") or []
@@ -637,7 +713,7 @@ def _worker(cmd: list[str], workspace: Path, mode: str, task: str,
         extra = " It reported an error." + extra
 
     _announce(player, (
-        f"[CODE_AGENT] The coding agent finished '{task[:90]}' after "
+        f"[AGENT] The agent finished '{task[:90]}' after "
         f"{elapsed:.0f} seconds. Its report: {_summarise(result, 700) or '(nothing)'}"
         f"{extra} Tell the user the outcome in their own language, in one or "
         f"two short sentences. The full text is already on their screen."
@@ -672,7 +748,7 @@ def run(parameters: dict, player=None) -> str:
     # ── status ───────────────────────────────────────────────────────────────
     if action in ("status", "check"):
         if not job:
-            return "The coding agent is not running anything right now."
+            return "The agent is not running anything right now."
         mins = (time.monotonic() - job["started"]) / 60
         return (f"Still working on '{job['task'][:80]}' in "
                 f"{job['workspace'].name}, {mins:.0f} minute(s) so far.")
@@ -688,13 +764,13 @@ def run(parameters: dict, player=None) -> str:
                 proc = _job.get("proc")
         if proc:
             _kill_tree(proc)
-        return f"Stopped the coding agent. It was working on '{job['task'][:80]}'."
+        return f"Stopped the agent. It was working on '{job['task'][:80]}'."
 
     # ── run ──────────────────────────────────────────────────────────────────
     if job:
         mins = (time.monotonic() - job["started"]) / 60
         return (
-            f"The coding agent is already busy with '{job['task'][:70]}' "
+            f"The agent is already busy with '{job['task'][:70]}' "
             f"({mins:.0f} min so far). Tell the user, and ask whether to wait "
             f"or cancel that one first — do not start a second task."
         )
@@ -708,9 +784,13 @@ def run(parameters: dict, player=None) -> str:
     if mode not in _MODES:
         mode = _DEFAULT_MODE
 
-    model = str(params.get("model") or _setting("model", _DEFAULT_MODEL)).lower().strip()
-    if model not in ("sonnet", "opus"):
-        model = _DEFAULT_MODEL
+    spec, agent_key, agent_problem = _resolve_agent(str(params.get("agent", "")))
+    if agent_problem:
+        return agent_problem
+
+    model = str(params.get("model") or _setting("model", "")).lower().strip()
+    if model not in spec["models"]:
+        model = spec["default_model"]
 
     try:
         timeout_s = int(float(_setting("timeout_min", _DEFAULT_TIMEOUT_MIN))) * 60
@@ -727,7 +807,7 @@ def run(parameters: dict, player=None) -> str:
         if not workspace.is_dir():
             return (
                 f"The configured workspace folder does not exist: {workspace}. "
-                f"Tell the user to set it in Settings, Claude Code."
+                f"Tell the user to set it in Settings, Delegate."
             )
 
     if _too_broad(workspace):
@@ -744,7 +824,7 @@ def run(parameters: dict, player=None) -> str:
             resume = _last_session_id
 
     try:
-        cmd = _build_command(task, mode, model, workspace, resume)
+        cmd = _build_command(spec, task, mode, model, workspace, resume)
     except FileNotFoundError as e:
         return str(e)
 
@@ -752,9 +832,10 @@ def run(parameters: dict, player=None) -> str:
 
     thread = threading.Thread(
         target=_worker,
-        args=(cmd, workspace, mode, task, timeout_s, player),
+        args=(cmd, workspace, mode, task, timeout_s, player,
+              agent_key, spec["label"]),
         daemon=True,
-        name="CodeAgent",
+        name="DelegatedTask",
     )
     with _job_lock:
         _job = {
@@ -767,7 +848,7 @@ def run(parameters: dict, player=None) -> str:
     # Returning now is the whole point: the live session gets its tool_response
     # immediately and stays up while the work carries on.
     return (
-        f"Started the coding agent on '{task[:80]}' in {workspace.name}, in "
+        f"Started the agent on '{task[:80]}' in {workspace.name}, in "
         f"{mode} mode. Tell the user it is working and that you will report "
         f"back when it is done — one short sentence, in their language. Do not "
         f"call this tool again for the same request."

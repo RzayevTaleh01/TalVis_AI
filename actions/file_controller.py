@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import platform
 from pathlib import Path
@@ -158,9 +159,21 @@ def _resolve_path(raw: str) -> Path:
         "videos":    _get_videos(),
         "home":      Path.home(),
     }
-    lower = raw.strip().lower()
+    raw = raw.strip()
+    lower = raw.lower()
     if lower in shortcuts:
         return shortcuts[lower]
+
+    # A shortcut can be followed by a subpath ("desktop/TripCalc",
+    # "downloads\\2024"). Without this, only the bare shortcut word resolved
+    # to the real folder — anything after a slash fell through to
+    # Path(raw).expanduser(), a path relative to wherever the app happens to
+    # be running from, so "desktop/TripCalc" silently wrote inside the app's
+    # own install folder instead of the user's actual Desktop.
+    parts = re.split(r"[\\/]+", raw, maxsplit=1)
+    if len(parts) == 2 and parts[0].lower() in shortcuts and parts[1]:
+        return shortcuts[parts[0].lower()] / parts[1]
+
     return Path(raw).expanduser()
 
 def _format_size(b: int) -> str:

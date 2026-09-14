@@ -228,6 +228,23 @@ def _clipboard_get() -> str:
     return "(copied — pyperclip unavailable for read)"
 
 
+def _clipboard_copy(text: str) -> str:
+    """Put `text` on the OS clipboard — no keystroke sent, nothing pasted.
+
+    When no text is given, falls back to reading the clipboard (the old
+    'copy' behaviour) so "what's on my clipboard" still works. Previously
+    'copy' ALWAYS read the clipboard and ignored `text`, so asking to copy a
+    path or a piece of text silently returned whatever was already sitting
+    in the clipboard from an earlier, unrelated action instead of putting
+    the requested text there."""
+    if not text:
+        return _clipboard_get()
+    if _PYPERCLIP:
+        pyperclip.copy(text)
+        return f"Copied to clipboard: {text[:60]}{'…' if len(text) > 60 else ''}"
+    return "pyperclip not available"
+
+
 def _clipboard_paste(text: str) -> str:
     if _PYPERCLIP:
         pyperclip.copy(text)
@@ -393,7 +410,7 @@ def computer_control(
       hotkey        — key combination
       press         — single key
       scroll        — scroll the wheel
-      copy          — read clipboard
+      copy          — put `text` on the clipboard (reads the clipboard if `text` is omitted)
       paste         — write + paste clipboard
       screenshot    — capture screen (safe path only)
       wait          — sleep N seconds
@@ -459,7 +476,7 @@ def computer_control(
             )
 
         if action == "copy":
-            return _clipboard_get()
+            return _clipboard_copy(params.get("text", ""))
 
         if action == "paste":
             return _clipboard_paste(params.get("text", ""))

@@ -48,3 +48,8 @@ desktop.ini
 logs/
 downloads/
 screenshots/
+
+# The record of what was delegated and how it went — local history.
+memory/journal.json
+# The assistant's working picture of you — personal, local.
+memory/understanding.json
