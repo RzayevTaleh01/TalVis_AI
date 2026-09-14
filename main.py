@@ -34,6 +34,19 @@ for _stream in (_sys.stdout, _sys.stderr):
     except Exception:
         pass
 
+# ── Watch our own output ─────────────────────────────────────────────────────
+# Installed here, before anything else can print, so no traceback escapes
+# unrecorded. It tees stdout and stderr to a log file and a ring buffer the
+# self_check tool reads — which is what lets the assistant diagnose its own
+# failures instead of asking the user to describe a stack trace out loud.
+# Wrapped in try/except deliberately: logging must never be the thing that
+# stops the app from starting.
+try:
+    from core import selflog as _selflog
+    _selflog.install()
+except Exception as _e:                                  # pragma: no cover
+    print(f"[SelfLog] disabled: {_e}")
+
 import asyncio
 import re
 import threading
@@ -429,6 +442,7 @@ class TalVisLive:
         self.ui.get_plugins = self._plugin_registry.list_for_ui
         self.ui.get_plugin_settings = self._plugin_registry.settings_schemas  # ⚙ settings tab
         self.ui.request_say = self.plugin_say   # plugins: mid-task speech channel
+        self.ui.get_active_jobs = self._active_jobs   # ⚡ ACTIVE TASKS panel
 
         # ── Wake word ────────────────────────────────────────────────────────
         # _awake gates the mic (see _listen_audio) and the background speakers.
@@ -528,6 +542,26 @@ class TalVisLive:
     def _ui_wake_install(self) -> tuple[bool, str]:
         """Download openwakeword + the model (runs in a UI worker thread)."""
         return wake_install(logger=lambda m: self.ui.write_log(f"SYS: {m}"))
+
+    def _active_jobs(self) -> list[dict]:
+        """Every long-running job any plugin is currently holding.
+
+        Asked of the plugins rather than of delegate by name: a second agent
+        plugin only has to expose active_jobs() to appear in the HUD, which is
+        the point of the plugin system. Called from the Qt thread once a
+        second, so it stays cheap and never raises.
+        """
+        jobs: list[dict] = []
+        for module in list(sys.modules.values()):
+            try:
+                if not getattr(module, "__name__", "").startswith("plugins."):
+                    continue
+                getter = getattr(module, "active_jobs", None)
+                if callable(getter):
+                    jobs.extend(getter() or [])
+            except Exception:
+                continue
+        return jobs
 
     def plugin_say(self, instruction: str) -> None:
         """
@@ -940,7 +974,11 @@ class TalVisLive:
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
 
-        print(f"[TalVis] 📤 {name} → {str(result)[:80]}")
+        # Collapsed to one line on purpose. self_check returns a traceback, and
+        # a multi-line echo of it here would be captured by selflog as a fresh
+        # error — the tool's own output becoming the next thing it reports.
+        _echo = " ".join(str(result).split())[:80]
+        print(f"[TalVis] 📤 {name} → {_echo}")
         return types.FunctionResponse(
             id=fc.id, name=name,
             response={"result": result}

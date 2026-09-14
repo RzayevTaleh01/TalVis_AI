@@ -926,6 +926,93 @@ def _fmt_size(size: int) -> str:
     else:                return f"{size/1024**3:.1f} GB"
 
 
+class ActiveTasksPanel(QWidget):
+    """Live list of the agent tasks running right now.
+
+    Polled rather than pushed. The jobs live in a plugin, mutated by worker
+    threads that know nothing about Qt; a signal from each of them would mean
+    the plugin importing the UI and every worker marshalling to the Qt thread.
+    A one-second poll on the thread that owns the widgets costs nothing —
+    there are never more than a handful of rows — and keeps the dependency
+    pointing one way.
+    """
+
+    POLL_MS = 1000
+
+    def __init__(self):
+        super().__init__()
+        self.get_jobs = None          # set by JarvisUI; () -> list[dict]
+        self._rows: list[QLabel] = []
+
+        self._lay = QVBoxLayout(self)
+        self._lay.setContentsMargins(0, 0, 0, 0)
+        self._lay.setSpacing(3)
+
+        self._idle = QLabel("No agent tasks running")
+        self._idle.setFont(QFont("Courier New", 7))
+        self._idle.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        self._lay.addWidget(self._idle)
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._refresh)
+        self._timer.start(self.POLL_MS)
+
+    def _make_row(self) -> QLabel:
+        lbl = QLabel()
+        lbl.setFont(QFont("Courier New", 7))
+        lbl.setWordWrap(True)
+        lbl.setStyleSheet(
+            f"color: {C.TEXT}; background: {C.PANEL2};"
+            f"border: 1px solid {C.BORDER_A}; border-left: 2px solid {C.PRI};"
+            f"border-radius: 3px; padding: 3px 5px;"
+        )
+        self._lay.addWidget(lbl)
+        self._rows.append(lbl)
+        return lbl
+
+    @staticmethod
+    def _elapsed(seconds: float) -> str:
+        seconds = int(seconds)
+        if seconds < 60:
+            return f"{seconds}s"
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+
+    def _refresh(self) -> None:
+        # A failure here must never be able to take the HUD down — this is a
+        # status readout, and a broken readout is not worth a dead window.
+        try:
+            jobs = self.get_jobs() if callable(self.get_jobs) else []
+        except Exception:
+            jobs = []
+
+        self._idle.setVisible(not jobs)
+
+        while len(self._rows) < len(jobs):
+            self._make_row()
+
+        for i, lbl in enumerate(self._rows):
+            if i >= len(jobs):
+                lbl.setVisible(False)
+                continue
+            job = jobs[i]
+            state = "STOPPING" if job.get("cancelled") else "RUNNING"
+            colour = C.MUTED_C if job.get("cancelled") else C.PRI
+            task = job.get("task", "")
+            task = task if len(task) <= 78 else task[:75] + "…"
+            agent = job.get("agent") or "agent"
+            lbl.setText(
+                f"{job.get('id','?')} · {agent} · {job.get('project','?')} · "
+                f"{job.get('mode','?')} · {self._elapsed(job.get('elapsed_s', 0))} "
+                f"· {state}\n{task}"
+            )
+            lbl.setStyleSheet(
+                f"color: {C.TEXT}; background: {C.PANEL2};"
+                f"border: 1px solid {C.BORDER_A}; border-left: 2px solid {colour};"
+                f"border-radius: 3px; padding: 3px 5px;"
+            )
+            lbl.setVisible(True)
+
+
 class FileDropZone(QWidget):
     file_selected = pyqtSignal(str)
 
@@ -2779,6 +2866,7 @@ class MainWindow(QMainWindow):
         self._confirm_overlay  = None   # live ConfirmBanner, if one is on screen
         self.get_plugins       = None   # callable: () -> list[dict], set by TalVisLive
         self.get_plugin_settings = None # callable: () -> list[dict] settings schemas, set by TalVisLive
+        self.get_active_jobs   = None   # callable: () -> list[dict], feeds ACTIVE TASKS
         self.on_wake_toggle    = None   # callable: (enable: bool) -> str, set by TalVisLive
         self.on_wake_manual    = None   # callable: () -> None — manual sleep/wake
         self.wake_get_state    = None   # callable: () -> dict {enabled, awake, ready}
@@ -3114,7 +3202,7 @@ class MainWindow(QMainWindow):
             sc.TargetPath       = target
             sc.Arguments        = f'"{args}"'
             sc.WorkingDirectory = work_dir
-            sc.Description      = "J.A.R.V.I.S AI Assistant"
+            sc.Description      = "TalVis AI Assistant"
             sc.IconLocation     = icon_loc
             sc.save()
             return
@@ -3129,7 +3217,7 @@ class MainWindow(QMainWindow):
             f'sc.TargetPath = "{target}"',
             f'sc.Arguments = Chr(34) & "{args}" & Chr(34)',
             f'sc.WorkingDirectory = "{work_dir}"',
-            'sc.Description = "J.A.R.V.I.S AI Assistant"',
+            'sc.Description = "TalVis AI Assistant"',
             f'sc.IconLocation = "{icon_loc}"',
             'sc.Save',
         ])
@@ -3252,14 +3340,14 @@ class MainWindow(QMainWindow):
             if _os == "Windows":
                 pythonw  = python.parent / "pythonw.exe"
                 target   = str(pythonw if pythonw.exists() else python)
-                lnk      = str(desktop / "J.A.R.V.I.S.lnk")
+                lnk      = str(desktop / "TalVis.lnk")
                 icon_loc = str(ico_path) if ico_path.exists() else f"{target},0"
                 self._create_lnk_windows(lnk, target, str(script),
                                          str(script.parent), icon_loc)
 
             # ── macOS — proper .app bundle (no Terminal window) ───────────────
             elif _os == "Darwin":
-                app     = desktop / "J.A.R.V.I.S.app"
+                app     = desktop / "TalVis.app"
                 mac_dir = app / "Contents" / "MacOS"
                 res_dir = app / "Contents" / "Resources"
                 mac_dir.mkdir(parents=True, exist_ok=True)
@@ -3285,7 +3373,7 @@ class MainWindow(QMainWindow):
                     '  <key>CFBundleExecutable</key><string>TalVis</string>\n'
                     '  <key>CFBundleIdentifier</key>'
                     '<string>com.talvis.assistant</string>\n'
-                    '  <key>CFBundleName</key><string>J.A.R.V.I.S</string>\n'
+                    '  <key>CFBundleName</key><string>TalVis</string>\n'
                     '  <key>CFBundlePackageType</key><string>APPL</string>\n'
                     '  <key>CFBundleVersion</key><string>1.0</string>\n'
                     '</dict></plist>\n'
@@ -3323,10 +3411,10 @@ class MainWindow(QMainWindow):
                         png_path = ico_path  # fallback to .ico
 
                 icon_line = f"Icon={png_path}\n" if png_path.exists() else ""
-                desk = desktop / "J.A.R.V.I.S.desktop"
+                desk = desktop / "TalVis.desktop"
                 desk.write_text(
                     "[Desktop Entry]\n"
-                    "Name=J.A.R.V.I.S\n"
+                    "Name=TalVis\n"
                     f"Exec={python} {script}\n"
                     f"Path={script.parent}\n"
                     "Type=Application\n"
@@ -3590,9 +3678,45 @@ class MainWindow(QMainWindow):
             l.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
             return l
 
-        lay.addWidget(_sec("ACTIVITY LOG"))
+        # Agents work in the background for minutes at a time, and until now
+        # the only sign of them was a sentence when they started and another
+        # when they finished. With several running at once that is not enough
+        # to answer "what is it doing, and is it still going" — so the panel
+        # shows them live, beside the log they would otherwise scroll out of.
+        tasks_col = QWidget()
+        tasks_lay = QVBoxLayout(tasks_col)
+        tasks_lay.setContentsMargins(0, 0, 0, 0)
+        tasks_lay.setSpacing(6)
+        self._tasks_header = _sec("ACTIVE TASKS")
+        tasks_lay.addWidget(self._tasks_header)
+        self._tasks_panel = ActiveTasksPanel()
+        tasks_lay.addWidget(self._tasks_panel)
+        tasks_lay.addStretch(1)
+
+        log_col = QWidget()
+        log_lay = QVBoxLayout(log_col)
+        log_lay.setContentsMargins(0, 0, 0, 0)
+        log_lay.setSpacing(6)
+        log_lay.addWidget(_sec("ACTIVITY LOG"))
         self._log = LogWidget()
-        lay.addWidget(self._log, stretch=1)
+        log_lay.addWidget(self._log, stretch=1)
+
+        self._tasks_log_split = QSplitter(Qt.Orientation.Vertical)
+        self._tasks_log_split.setChildrenCollapsible(False)
+        self._tasks_log_split.setStyleSheet(f"""
+            QSplitter::handle {{
+                background: {C.BORDER};
+                height: 4px;
+            }}
+            QSplitter::handle:hover {{
+                background: {C.PRI_DIM};
+            }}
+        """)
+        self._tasks_log_split.addWidget(tasks_col)
+        self._tasks_log_split.addWidget(log_col)
+        self._tasks_log_split.setStretchFactor(0, 2)
+        self._tasks_log_split.setStretchFactor(1, 3)
+        lay.addWidget(self._tasks_log_split, stretch=1)
 
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
@@ -4608,6 +4732,21 @@ class TalVisUI:
     @get_plugin_settings.setter
     def get_plugin_settings(self, cb):
         self._win.get_plugin_settings = cb
+
+    @property
+    def get_active_jobs(self):
+        return self._win.get_active_jobs
+
+    @get_active_jobs.setter
+    def get_active_jobs(self, cb):
+        self._win.get_active_jobs = cb
+        # The panel polls this directly, so it needs the callable too — wiring
+        # only the window would leave the widget asking an attribute that is
+        # always None, and the list would sit empty however many agents ran.
+        try:
+            self._win._tasks_panel.get_jobs = cb
+        except Exception:
+            pass
 
     @property
     def on_wake_toggle(self):

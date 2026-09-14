@@ -53,6 +53,7 @@ import shutil
 import subprocess
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 from memory import journal
@@ -149,10 +150,13 @@ PLUGIN = {
         "or answer questions you can already answer yourself — it takes minutes "
         "and spends the user's AI plan allowance. "
         "It returns IMMEDIATELY and keeps working in the background — say "
-        "one short sentence and move on; the result is delivered to you "
-        "later as a [AGENT] message. Never call it twice for the same "
-        "request. Use action='status' if the user asks whether it is done, "
-        "and action='cancel' to stop it."
+        "one short sentence and move on; the result arrives later as an "
+        "[AGENT] message naming the task. SEVERAL TASKS CAN RUN AT ONCE: "
+        "start a new one whenever the user asks, even while others are "
+        "going — never make them wait. The only pairing refused is two "
+        "agents editing the same folder. Just do not call it twice for "
+        "the SAME request. action='status' lists everything running; "
+        "action='cancel' stops one (name the project or task) or all."
     ),
     "parameters": {
         "type": "OBJECT",
@@ -555,8 +559,25 @@ def _summarise(text: str, limit: int = 420) -> str:
 #     moment, through the same channel proactive check-ins use — which also
 #     means a reconnect in the meantime costs nothing.
 
-_job: dict | None = None
+# Several tasks at once, keyed by job id.
+#
+# This started as a single slot that refused a second task. That was wrong for
+# the way the work actually arrives: the tasks are independent, they are mostly
+# spent waiting on a network round trip rather than on this machine, and making
+# the user watch one project finish before starting another wastes their time
+# for no benefit.
+#
+# Two limits remain, and both are about correctness rather than tidiness:
+# MAX_CONCURRENT keeps a slip of the tongue from launching a dozen agents on
+# one plan, and two writers are never allowed into the same folder at once —
+# concurrent agents editing the same files overwrite each other's work.
+_jobs: dict[str, dict] = {}
 _job_lock = threading.Lock()
+MAX_CONCURRENT = 4
+_job_seq = 0
+
+# Modes that can change files. Two of these in one folder is the collision.
+_WRITING_MODES = {"edit", "auto"}
 
 
 def _kill_tree(proc) -> None:
@@ -588,17 +609,65 @@ def _announce(player, instruction: str) -> None:
     _say(player, instruction)
 
 
-def _clear_job() -> bool:
-    """Drop the current job, reporting whether it had been cancelled."""
-    global _job
+def _clear_job(job_id: str) -> bool:
+    """Drop one job, reporting whether it had been cancelled."""
     with _job_lock:
-        cancelled = bool(_job and _job.get("cancelled"))
-        _job = None
-    return cancelled
+        job = _jobs.pop(job_id, None)
+    return bool(job and job.get("cancelled"))
+
+
+def active_jobs() -> list[dict]:
+    """What is running right now, for anything that wants to display it.
+
+    Kept plain and copied rather than handing out the live dicts: the HUD polls
+    this from the Qt thread while workers mutate the originals, and a reader
+    that can see a job half-updated is a crash waiting for a busy moment.
+    """
+    now = time.monotonic()
+    with _job_lock:
+        jobs = list(_jobs.values())
+    return [
+        {
+            "id": j["id"],
+            "task": j["task"],
+            "project": j["workspace"].name,
+            "mode": j["mode"],
+            "agent": j.get("agent_label") or j.get("agent", ""),
+            "elapsed_s": max(0.0, now - j["started"]),
+            "cancelled": bool(j.get("cancelled")),
+        }
+        for j in sorted(jobs, key=lambda x: x["started"])
+    ]
+
+
+def _describe_job(job: dict) -> str:
+    mins = (time.monotonic() - job["started"]) / 60
+    return (f"{job['id']}: \"{job['task'][:70]}\" in {job['workspace'].name} "
+            f"({job['mode']}, {mins:.0f} min)")
+
+
+def _match_jobs(hint: str) -> list[dict]:
+    """Jobs matching a spoken hint — a job id, a project, or task words."""
+    with _job_lock:
+        jobs = list(_jobs.values())
+    key = re.sub(r"\s+", " ", (hint or "").strip().lower())
+    if not key:
+        return jobs
+    exact = [j for j in jobs if j["id"].lower() == key]
+    if exact:
+        return exact
+    hits = [j for j in jobs
+            if key in j["workspace"].name.lower() or key in j["task"].lower()]
+    if hits:
+        return hits
+    words = [w for w in key.split() if len(w) > 2]
+    return [j for j in jobs
+            if any(w in f"{j['task']} {j['workspace'].name}".lower() for w in words)]
 
 
 def _worker(cmd: list[str], workspace: Path, mode: str, task: str,
-            timeout_s: int, player, agent_key: str, agent_label: str) -> None:
+            timeout_s: int, player, agent_key: str, agent_label: str,
+            job_id: str) -> None:
     global _last_session_id
     started = time.monotonic()
     stdout = stderr = ""
@@ -619,7 +688,7 @@ def _worker(cmd: list[str], workspace: Path, mode: str, task: str,
         _log(player, f"could not start: {e}")
         journal.record(task, "failed", agent=agent_key, detail=str(e)[:200],
                        workspace=workspace.name, mode=mode)
-        _clear_job()
+        _clear_job(job_id)
         _announce(player, (
             f"[AGENT] The agent could not start: {e}. "
             f"Tell the user briefly, in their language."
@@ -627,8 +696,8 @@ def _worker(cmd: list[str], workspace: Path, mode: str, task: str,
         return
 
     with _job_lock:
-        if _job is not None:
-            _job["proc"] = proc
+        if job_id in _jobs:
+            _jobs[job_id]["proc"] = proc
 
     try:
         stdout, stderr = proc.communicate(timeout=timeout_s)
@@ -643,7 +712,7 @@ def _worker(cmd: list[str], workspace: Path, mode: str, task: str,
         stderr = str(e)
 
     elapsed = time.monotonic() - started
-    cancelled = _clear_job()
+    cancelled = _clear_job(job_id)
 
     if cancelled:
         _log(player, f"cancelled after {elapsed:.0f}s")
@@ -738,41 +807,65 @@ def _too_broad(path: Path) -> bool:
 
 
 def run(parameters: dict, player=None) -> str:
-    global _job
+    global _job_seq
     params = parameters or {}
     action = str(params.get("action", "run")).lower().strip() or "run"
 
     with _job_lock:
-        job = dict(_job) if _job else None
+        running = list(_jobs.values())
 
     # ── status ───────────────────────────────────────────────────────────────
     if action in ("status", "check"):
-        if not job:
-            return "The agent is not running anything right now."
-        mins = (time.monotonic() - job["started"]) / 60
-        return (f"Still working on '{job['task'][:80]}' in "
-                f"{job['workspace'].name}, {mins:.0f} minute(s) so far.")
+        if not running:
+            return "No agents are running right now."
+        lines = "; ".join(_describe_job(j) for j in running)
+        return (f"{len(running)} task(s) running: {lines}. "
+                f"Tell the user what is in flight, briefly.")
 
     # ── cancel ───────────────────────────────────────────────────────────────
     if action in ("cancel", "stop", "abort"):
-        if not job:
+        if not running:
             return "Nothing is running, so there was nothing to cancel."
-        proc = None
-        with _job_lock:
-            if _job:
-                _job["cancelled"] = True
-                proc = _job.get("proc")
-        if proc:
-            _kill_tree(proc)
-        return f"Stopped the agent. It was working on '{job['task'][:80]}'."
+        hint = str(params.get("project") or params.get("task") or "").strip()
+
+        # "all" has to be read before matching, not after: as a search term it
+        # matches no project or task, so the lookup would report "no running
+        # task matches 'all'" and stop nothing.
+        if hint.lower() in ("all", "everything", "every", "both",
+                            "hamısı", "hamisi", "hər ikisi", "her ikisi"):
+            targets = running
+        else:
+            targets = _match_jobs(hint)
+            if not targets:
+                return (f"No running task matches '{hint}'. In flight: "
+                        f"{'; '.join(_describe_job(j) for j in running)}.")
+            # Several running and nothing said about which: ask rather than
+            # guess — cancelling the wrong one throws away real work.
+            if len(targets) > 1 and not hint:
+                return (f"{len(targets)} tasks are running: "
+                        f"{'; '.join(_describe_job(j) for j in targets)}. "
+                        f"Ask the user which one to stop, or say 'all' to stop "
+                        f"every one.")
+        stopped = []
+        for job in targets:
+            with _job_lock:
+                live = _jobs.get(job["id"])
+                if live:
+                    live["cancelled"] = True
+                    proc = live.get("proc")
+                else:
+                    proc = None
+            if proc:
+                _kill_tree(proc)
+            stopped.append(job["task"][:60])
+        return "Stopped: " + "; ".join(f"'{t}'" for t in stopped) + "."
 
     # ── run ──────────────────────────────────────────────────────────────────
-    if job:
-        mins = (time.monotonic() - job["started"]) / 60
+    if len(running) >= MAX_CONCURRENT:
         return (
-            f"The agent is already busy with '{job['task'][:70]}' "
-            f"({mins:.0f} min so far). Tell the user, and ask whether to wait "
-            f"or cancel that one first — do not start a second task."
+            f"{len(running)} tasks are already running, which is the limit. "
+            f"In flight: {'; '.join(_describe_job(j) for j in running)}. "
+            f"Ask the user whether to wait or cancel one."
         )
 
     task = str(params.get("task", "")).strip()
@@ -818,6 +911,23 @@ def run(parameters: dict, player=None) -> str:
             f"which project they mean. Recently used: {recent}."
         )
 
+    # Two agents writing in one folder is the one combination that cannot be
+    # allowed to run in parallel: they read the same files, then each writes
+    # back over the other's edits. Reading alongside anything is fine.
+    if mode in _WRITING_MODES:
+        clash = next((j for j in running
+                      if j["workspace"] == workspace
+                      and j["mode"] in _WRITING_MODES), None)
+        if clash:
+            mins = (time.monotonic() - clash["started"]) / 60
+            return (
+                f"An agent is already editing {workspace.name} "
+                f"('{clash['task'][:60]}', {mins:.0f} min in). Two agents "
+                f"changing the same folder would overwrite each other. Tell "
+                f"the user, and offer to queue this after it, run it read-only, "
+                f"or point it at a different project."
+            )
+
     resume = None
     if params.get("continue_previous"):
         with _lock:
@@ -828,28 +938,36 @@ def run(parameters: dict, player=None) -> str:
     except FileNotFoundError as e:
         return str(e)
 
-    _log(player, f"{mode}/{model} in {workspace.name}: {task[:70]}")
+    with _job_lock:
+        _job_seq += 1
+        job_id = f"t{_job_seq}"
+    _log(player, f"[{job_id}] {mode}/{model} in {workspace.name}: {task[:70]}")
 
     thread = threading.Thread(
         target=_worker,
         args=(cmd, workspace, mode, task, timeout_s, player,
-              agent_key, spec["label"]),
+              agent_key, spec["label"], job_id),
         daemon=True,
-        name="DelegatedTask",
+        name=f"DelegatedTask-{job_id}",
     )
     with _job_lock:
-        _job = {
-            "task": task, "workspace": workspace, "mode": mode,
+        _jobs[job_id] = {
+            "id": job_id, "task": task, "workspace": workspace, "mode": mode,
+            "agent": agent_key, "agent_label": spec["label"],
             "started": time.monotonic(), "proc": None,
             "cancelled": False, "thread": thread,
         }
+        others = len(_jobs) - 1
     thread.start()
 
     # Returning now is the whole point: the live session gets its tool_response
     # immediately and stays up while the work carries on.
+    alongside = (f" It is running alongside {others} other task(s)."
+                 if others else "")
     return (
-        f"Started the agent on '{task[:80]}' in {workspace.name}, in "
-        f"{mode} mode. Tell the user it is working and that you will report "
-        f"back when it is done — one short sentence, in their language. Do not "
-        f"call this tool again for the same request."
+        f"Started {job_id}: '{task[:80]}' in {workspace.name}, {mode} mode."
+        f"{alongside} Tell the user it is working and that you will report "
+        f"back when it is done — one short sentence, in their language. Do "
+        f"not call this tool again for the same request; other tasks can be "
+        f"started straight away."
     )
